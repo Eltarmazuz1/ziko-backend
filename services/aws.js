@@ -7,10 +7,10 @@ const crypto = require('crypto');
 
 // AWS Configuration (from environment variables, only on server!)
 const AWS_CONFIG = {
-  region: process.env.AWS_REGION || 'us-east-1',
+  region: process.env.AWS_REGION || process.env.EXPO_PUBLIC_AWS_REGION || 'us-east-1',
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || process.env.EXPO_PUBLIC_AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || process.env.EXPO_PUBLIC_AWS_SECRET_ACCESS_KEY,
   },
 };
 
@@ -218,10 +218,14 @@ const marketplaceService = {
   async listGiftCard(cardData) {
     return executeCloudOperation(
       async () => {
+        const listingId = cardData.id || `listing_${Date.now()}`;
+        const giftCardId = cardData.giftCardId || cardData.id;
+        
         const params = {
           TableName: TABLES.MARKETPLACE,
           Item: {
-            id: cardData.id,
+            id: listingId,
+            giftCardId: giftCardId, // Always save reference to original gift card
             sellerId: cardData.sellerId,
             sellerName: cardData.sellerName,
             storeName: cardData.storeName,
@@ -235,7 +239,7 @@ const marketplaceService = {
           },
         };
         await dynamodb.send(new PutCommand(params));
-        return { listing: params.Item };
+        return { success: true, listing: params.Item };
       },
       'list gift card'
     );
@@ -310,6 +314,60 @@ const marketplaceService = {
       'purchase gift card'
     );
   },
+
+  async unlistGiftCard(listingId, sellerId) {
+    return executeCloudOperation(
+      async () => {
+        // First, get the listing to verify ownership
+        const getParams = {
+          TableName: TABLES.MARKETPLACE,
+          Key: { id: listingId },
+        };
+        const listingResult = await dynamodb.send(new GetCommand(getParams));
+        
+        if (!listingResult.Item) {
+          return { success: false, error: 'Listing not found' };
+        }
+
+        const listing = listingResult.Item;
+        
+        // Verify that the seller is the owner
+        if (listing.sellerId !== sellerId) {
+          return { success: false, error: 'Unauthorized: You are not the owner of this listing' };
+        }
+
+        // Verify that the listing is still available (not sold)
+        if (listing.status !== 'available') {
+          return { success: false, error: 'Cannot unlist: Card has already been sold' };
+        }
+
+        // Delete the listing from marketplace
+        const deleteParams = {
+          TableName: TABLES.MARKETPLACE,
+          Key: { id: listingId },
+        };
+        await dynamodb.send(new DeleteCommand(deleteParams));
+
+        // Get the original gift card ID from the listing
+        const giftCardId = listing.giftCardId || listing.id;
+
+        // Update the gift card status back to 'active'
+        if (giftCardId) {
+          const updateParams = {
+            TableName: TABLES.GIFT_CARDS,
+            Key: { id: giftCardId },
+            UpdateExpression: 'SET #status = :status',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':status': 'active' },
+          };
+          await dynamodb.send(new UpdateCommand(updateParams));
+        }
+
+        return { success: true, giftCardId };
+      },
+      'unlist gift card'
+    );
+  },
 };
 
 // S3 Operations
@@ -337,6 +395,8 @@ const s3Service = {
     return executeCloudOperation(
       async () => {
         const key = `gift-cards/${cardId}/${Date.now()}.${imageType}`;
+        // Note: ACL is set via bucket policy, not in presigned URL
+        // Some S3 configurations don't support ACL in presigned URLs
         const command = new PutObjectCommand({
           Bucket: BUCKETS.GIFT_CARD_IMAGES,
           Key: key,
@@ -346,6 +406,26 @@ const s3Service = {
         return { url: signedUrl, key };
       },
       'get presigned upload url'
+    );
+  },
+
+  async getPresignedProfileImageUrl(userId, imageType = 'jpg') {
+    return executeCloudOperation(
+      async () => {
+        const key = `profiles/${userId}/${Date.now()}.${imageType}`;
+        // Note: ACL is set via bucket policy, not in presigned URL
+        // Some S3 configurations don't support ACL in presigned URLs
+        const command = new PutObjectCommand({
+          Bucket: BUCKETS.USER_PROFILES,
+          Key: key,
+          ContentType: `image/${imageType}`,
+        });
+        const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
+        const imageUrl = `https://${BUCKETS.USER_PROFILES}.s3.${AWS_CONFIG.region}.amazonaws.com/${key}`;
+        console.log('📸 Generated presigned URL for profile image:', { key, imageUrl });
+        return { url: signedUrl, key, imageUrl };
+      },
+      'get presigned profile image url'
     );
   },
 

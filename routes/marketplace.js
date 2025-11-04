@@ -35,5 +35,25 @@ router.post('/purchase', async (req, res) => {
   }
 });
 
+router.delete('/unlist/:listingId', async (req, res) => {
+  try {
+    const { listingId } = req.params;
+    const { sellerId } = req.body;
+    
+    if (!sellerId) {
+      return res.status(400).json({ success: false, error: 'sellerId is required' });
+    }
+    
+    const result = await marketplaceService.unlistGiftCard(listingId, sellerId);
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 module.exports = router;
 
